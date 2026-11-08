@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+*.log
+/data/
+/last_run.json
+/recommendations_history.json
+__pycache__/
+*.py[cod]
+.pytest_cache/
