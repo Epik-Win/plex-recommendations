@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os, sys, logging, requests, time, json, random
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -395,6 +396,7 @@ class DiscordNotifier:
             logger.error(f"Failed to send Discord message: {e}")
             return False
 
+
     def build_show_embeds(self, show_selections: list) -> list:
         embeds = [{
             "title": "📺 Recommended TV Shows For You",
@@ -466,6 +468,52 @@ class DiscordNotifier:
         return embeds
 
 
+class TelegramNotifier:
+    def __init__(self, bot_token: str, chat_ids: list[str]):
+        self.bot_token = bot_token
+        self.chat_ids = chat_ids
+
+    @staticmethod
+    def _render_embed(embed: dict) -> str:
+        parts = [embed.get("title", ""), embed.get("description", "")]
+        for field in embed.get("fields", []):
+            parts.append(f"{field.get('name', '')}\n{field.get('value', '')}")
+        text = "\n\n".join(part for part in parts if part)
+        text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1: \2", text)
+        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+        text = re.sub(r"~~(.*?)~~", r"\1", text)
+        return text.replace("`", "")
+
+    def send_message(self, embeds: list) -> bool:
+        success = True
+        for embed in embeds:
+            text = self._render_embed(embed)
+            for chat_id in self.chat_ids:
+                for start in range(0, len(text), 4000):
+                    try:
+                        response = requests.post(
+                            f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
+                            json={"chat_id": chat_id, "text": text[start:start + 4000]},
+                            timeout=10,
+                        )
+                        response.raise_for_status()
+                        if not response.json().get("ok"):
+                            raise RuntimeError("Telegram API rejected the message")
+                    except Exception as exc:
+                        response = getattr(exc, "response", None)
+                        status = getattr(response, "status_code", None)
+                        logger.error(
+                            "Failed to send Telegram message to chat %s (%s%s)",
+                            chat_id,
+                            type(exc).__name__,
+                            f", HTTP {status}" if status else "",
+                        )
+                        success = False
+        if success:
+            logger.info("Successfully sent Telegram messages")
+        return success
+
+
 # --- Main ---
 
 def fetch_and_post(debug: bool = False):
@@ -481,15 +529,27 @@ def fetch_and_post(debug: bool = False):
     plex_server_url = os.getenv("PLEX_SERVER_URL", "http://localhost:32400")
     plex_token = os.getenv("PLEX_TOKEN")
     tmdb_api_key = os.getenv("TMDB_API_KEY")
-    webhook = os.getenv("DISCORD_WEBHOOK_URL")
+    webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    telegram_chat_ids = [
+        chat_id.strip() for chat_id in os.getenv("TELEGRAM_CHAT_IDS", "").split(",")
+        if chat_id.strip()
+    ]
 
-    if not all([plex_username, plex_password, plex_token, tmdb_api_key, webhook]):
-        logger.error("Missing required environment variables: PLEX_USERNAME, PLEX_PASSWORD, PLEX_TOKEN, TMDB_API_KEY, DISCORD_WEBHOOK_URL")
+    if not all([plex_username, plex_password, plex_token, tmdb_api_key]):
+        logger.error("Missing required environment variables: PLEX_USERNAME, PLEX_PASSWORD, PLEX_TOKEN, TMDB_API_KEY")
+        return False
+    if not webhook and not (telegram_token and telegram_chat_ids):
+        logger.error("Configure DISCORD_WEBHOOK_URL or both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS")
+        return False
+    if bool(telegram_token) != bool(telegram_chat_ids):
+        logger.error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS must be configured together")
         return False
 
     plex = PlexDiscoverClient(plex_username, plex_password, plex_server_url, plex_token)
     tmdb = TMDBClient(tmdb_api_key)
     discord = DiscordNotifier(webhook)
+    telegram = TelegramNotifier(telegram_token, telegram_chat_ids) if telegram_token else None
 
     movie_pool = plex.get_recommendation_pool("movie", debug=debug)
     show_pool = plex.get_recommendation_pool("show", debug=debug)
@@ -510,21 +570,38 @@ def fetch_and_post(debug: bool = False):
     for item, _ in movie_selections:
         all_recommendations.append({"id": plex._item_id(item, "movie"), "type": "movie"})
 
-    if not debug:
-        plex.history.add_recommendations(all_recommendations)
-    else:
-        logger.info("DEBUG: Skipping history save")
-
     if debug:
         logger.info("DEBUG: Skipping local AI wait — summaries will be truncated.")
     elif not wait_for_local_ai():
         logger.warning("Proceeding without local AI — summaries will be truncated.")
 
+    deliveries_succeeded = True
     if show_selections:
-        discord.send_message(discord.build_show_embeds(show_selections))
+        show_embeds = discord.build_show_embeds(show_selections)
+        show_deliveries = []
+        if webhook:
+            show_deliveries.append(discord.send_message(show_embeds))
+        if telegram:
+            show_deliveries.append(telegram.send_message(show_embeds))
+        deliveries_succeeded = any(show_deliveries) and deliveries_succeeded
         time.sleep(1)
     if movie_selections:
-        discord.send_message(discord.build_movie_embeds(movie_selections))
+        movie_embeds = discord.build_movie_embeds(movie_selections)
+        movie_deliveries = []
+        if webhook:
+            movie_deliveries.append(discord.send_message(movie_embeds))
+        if telegram:
+            movie_deliveries.append(telegram.send_message(movie_embeds))
+        deliveries_succeeded = any(movie_deliveries) and deliveries_succeeded
+
+    if not deliveries_succeeded:
+        logger.error("One or more recommendation groups had no successful notification destination")
+        return False
+
+    if not debug:
+        plex.history.add_recommendations(all_recommendations)
+    else:
+        logger.info("DEBUG: Skipping history save")
 
     logger.info("=" * 60)
     logger.info("Weekly recommendations fetch completed successfully")
